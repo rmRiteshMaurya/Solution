@@ -1,0 +1,142 @@
+global class StaleLeadBatch implements
+    Database.Batchable<SObject>,
+    Database.Stateful {
+
+    global Integer totalProcessed = 0;
+    global Integer totalConverted = 0;
+    global Integer totalDisqualified = 0;
+
+    global List<String> failures = new List<String>();
+
+    private Integer batchSize;
+
+    public StaleLeadBatch() {
+        batchSize = 200;
+    }
+
+    public StaleLeadBatch(Integer size) {
+        batchSize = size;
+    }
+
+    global Database.QueryLocator start(Database.BatchableContext bc) {
+        return Database.getQueryLocator([SELECT Id, Email, Industry, Company, Status FROM Lead WHERE CreatedDate <= :System.today().addDays(-90)]);
+    }
+
+    global void execute(
+        Database.BatchableContext bc,
+        List<Lead> scope
+    ) {
+
+        Set<String> industries = new Set<String>();
+
+        for(Lead_Industry_Config__mdt rule :
+            [SELECT Industry_Name__c FROM Lead_Industry_Config__mdt]) {
+
+            industries.add(rule.Industry_Name__c);
+        }
+
+        List<Database.LeadConvert> converts =
+            new List<Database.LeadConvert>();
+
+        List<Lead> disqualified =
+            new List<Lead>();
+
+        for(Lead l : scope) {
+            Integer score = 0;
+
+            if(l.Email != null &&
+               !l.Email.contains('gmail.com') &&
+               !l.Email.contains('yahoo.com')) {
+                score += 10;
+            }
+
+            if(l.Company != null) {
+                score += 15;
+            }
+
+            if(industries.contains(l.Industry)) {
+                score += 20;
+            }
+            totalProcessed++;
+
+            if(score > 30) {
+                Database.LeadConvert lc =
+                    new Database.LeadConvert();
+
+                lc.setLeadId(l.Id);
+
+                lc.setConvertedStatus(
+                    'Closed - Converted'
+                );
+                converts.add(lc);
+            } else {
+                l.Status = 'Disqualified';
+                disqualified.add(l);
+                totalDisqualified++;
+            }
+        }
+
+        if(!disqualified.isEmpty()) {
+            update disqualified;
+        }
+
+        if(!converts.isEmpty()) {
+            List<Database.LeadConvertResult> results =
+                Database.convertLead(converts,false);
+
+            for(Database.LeadConvertResult r : results) {
+                if(r.isSuccess()) {
+                    totalConverted++;
+                } else {
+                    for(Database.Error e :
+                        r.getErrors()) {
+                        failures.add(
+                            e.getMessage()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    global void finish(Database.BatchableContext bc) {
+
+        Messaging.SingleEmailMessage email =
+            new Messaging.SingleEmailMessage();
+
+        email.setToAddresses(
+            new String[]{
+                UserInfo.getUserEmail()
+            }
+        );
+
+        String body =
+            'Lead Processing Summary\n\n' +
+            'Processed : ' + totalProcessed + '\n' +
+            'Converted : ' + totalConverted + '\n' +
+            'Disqualified : ' + totalDisqualified + '\n\n';
+
+        if(!failures.isEmpty()) {
+            body += 'Failures:\n';
+            for(String f : failures) {
+                body += f + '\n';
+            }
+        }
+
+        email.setSubject(
+            'Stale Lead Batch Summary'
+        );
+
+        email.setPlainTextBody(body);
+
+        Messaging.sendEmail(
+            new Messaging.SingleEmailMessage[]{
+                email
+            }
+        );
+    }
+
+    public Integer getBatchSize() {
+        return batchSize;
+    }
+}
